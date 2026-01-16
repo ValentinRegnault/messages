@@ -1,5 +1,7 @@
 """Tests for send_message_task."""
 
+# pylint: disable=no-value-for-parameter,unused-argument
+
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -40,7 +42,7 @@ class TestSendMessageTask:
         self, draft_message, mailbox_with_thread
     ):
         """Test send_message_task with must_archive=True archives all thread messages."""
-        mailbox, thread = mailbox_with_thread
+        _mailbox, thread = mailbox_with_thread
 
         # Create additional messages in the same thread
         other_message1 = factories.MessageFactory(
@@ -94,7 +96,7 @@ class TestSendMessageTask:
         self, draft_message, mailbox_with_thread
     ):
         """Test send_message_task with must_archive=False does not archive messages."""
-        mailbox, thread = mailbox_with_thread
+        _mailbox, thread = mailbox_with_thread
 
         # Create additional messages in the same thread
         other_message = factories.MessageFactory(

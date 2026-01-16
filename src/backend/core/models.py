@@ -29,6 +29,7 @@ from encrypted_fields.fields import EncryptedTextField
 from timezone_field import TimeZoneField
 
 from core.enums import (
+    BlobStorageLocationChoices,
     CompressionTypeChoices,
     CRUDAbilities,
     DKIMAlgorithmChoices,
@@ -1468,13 +1469,21 @@ class BlobManager(models.Manager):
                 {"compression": f"Unsupported compression type: {compression}"}
             )
 
+        # Encrypt content if encryption keys are configured
+        # pylint: disable-next=import-outside-toplevel
+        from core.services.tiered_storage import TieredStorageService
+
+        service = TieredStorageService()
+        encrypted_content, encryption_key_id = service.encrypt(compressed_content)
+
         # Create the blob
         blob = Blob.objects.create(
             sha256=sha256_hash,
             size=original_size,
             content_type=content_type,
             compression=compression,
-            raw_content=compressed_content,
+            raw_content=encrypted_content,
+            encryption_key_id=encryption_key_id,
             **kwargs,
         )
 
@@ -1526,7 +1535,25 @@ class Blob(BaseModel):
 
     raw_content = models.BinaryField(
         _("raw content"),
-        help_text=_("Compressed binary content of the blob"),
+        null=True,
+        blank=True,
+        help_text=_(
+            "Compressed binary content of the blob (null if in object storage)"
+        ),
+    )
+
+    # Tiered storage fields
+    storage_location = models.SmallIntegerField(
+        _("storage location"),
+        choices=BlobStorageLocationChoices.choices,
+        default=BlobStorageLocationChoices.POSTGRES,
+        help_text=_("Where the blob content is stored"),
+        db_index=True,
+    )
+    encryption_key_id = models.SmallIntegerField(
+        _("encryption key ID"),
+        default=0,
+        help_text=_("Encryption key ID (0=none, >=1=encrypted with keys[key_id-1])"),
     )
 
     mailbox = models.ForeignKey(
@@ -1566,25 +1593,71 @@ class Blob(BaseModel):
         return f"Blob {self.id} ({self.size} bytes)"
 
     def save(self, *args, **kwargs):
-        """Compute size_compressed and save the blob."""
-        self.size_compressed = len(self.raw_content)
+        """Compute size_compressed (if raw_content present) and save the blob."""
+        if self.raw_content is not None:
+            self.size_compressed = len(self.raw_content)
         super().save(*args, **kwargs)
+
+    @staticmethod
+    def compute_storage_key(sha256_bytes: bytes) -> str:
+        """Compute object storage key from SHA256 hash: blobs/{sha[:3]}/{sha}"""
+        sha_hex = sha256_bytes.hex()
+        return f"blobs/{sha_hex[:3]}/{sha_hex}"
+
+    def get_storage_key(self) -> str:
+        """Get the object storage key for this blob."""
+        return self.compute_storage_key(bytes(self.sha256))
 
     def get_content(self) -> bytes:
         """
         Get the decompressed content of this blob.
 
+        Transparently handles both PostgreSQL and object storage locations,
+        and decrypts if encrypted.
+
         Returns:
             The decompressed content
 
         Raises:
-            ValueError: If the blob compression type is not supported
+            ValueError: If the blob compression type is not supported or content unavailable
         """
+        # pylint: disable-next=import-outside-toplevel
+        from core.services.tiered_storage import TieredStorageService
+
+        service = TieredStorageService()
+
+        if self.storage_location == BlobStorageLocationChoices.POSTGRES:
+            if self.raw_content is None:
+                raise ValueError(f"Blob {self.id} has no content in PostgreSQL")
+            encrypted = bytes(self.raw_content)
+            # Decrypt if encrypted (key_id > 0)
+            compressed = service.decrypt(encrypted, self.encryption_key_id)
+        else:
+            # download_blob already handles decryption
+            compressed = service.download_blob(self)
+
         if self.compression == CompressionTypeChoices.NONE:
-            return self.raw_content
+            return compressed
         if self.compression == CompressionTypeChoices.ZSTD:
-            return pyzstd.decompress(self.raw_content)
+            return pyzstd.decompress(compressed)
         raise ValueError(f"Unsupported compression type: {self.compression}")
+
+    def delete(self, *args, **kwargs):
+        """Delete blob, cleaning up object storage if orphaned."""
+        sha256_copy = bytes(self.sha256)
+        storage_location_copy = self.storage_location
+
+        # Delete from DB first
+        super().delete(*args, **kwargs)
+
+        # Then cleanup storage if was in object storage
+        if storage_location_copy == BlobStorageLocationChoices.OBJECT_STORAGE:
+            # pylint: disable-next=import-outside-toplevel
+            from core.services.tiered_storage import TieredStorageService
+
+            service = TieredStorageService()
+            if service.enabled:
+                service.delete_if_orphaned(sha256_copy)
 
 
 class Attachment(BaseModel):

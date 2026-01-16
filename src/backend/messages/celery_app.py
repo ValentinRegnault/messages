@@ -45,4 +45,9 @@ if not settings.DISABLE_CELERY_BEAT_SCHEDULE:
             "schedule": 300.0,  # Every 5 minutes
             "options": {"queue": "default"},
         },
+        "offload-blobs-to-object-storage": {
+            "task": "core.services.tiered_storage_tasks.offload_blobs_task",
+            "schedule": 3600.0,  # Every hour
+            "options": {"queue": "default"},
+        },
     }
