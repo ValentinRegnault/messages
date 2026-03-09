@@ -1,11 +1,19 @@
 import { StatusEnum, useTasksRetrieve } from "@/features/api/gen";
-import { TaskMetadata } from "@/features/controlled-modals/message-importer/step-loader";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 const MAX_POLL_ERRORS = 10;
 
-export function useImportTaskStatus(
+export type TaskMetadata = {
+  current_message: number;
+  total_messages: number | null;
+  failure_count: number;
+  success_count: number;
+  message_status: string;
+  type: string;
+}
+
+export function useTaskStatus(
   taskId: string | null,
   {
     refetchInterval = 1000,
