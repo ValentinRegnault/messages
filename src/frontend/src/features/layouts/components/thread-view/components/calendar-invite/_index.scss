@@ -287,6 +287,18 @@
     flex-shrink: 0;
 }
 
+.calendar-invite__caldav-unavailable {
+    display: flex;
+    align-items: center;
+    gap: var(--c--globals--spacings--sm);
+    padding: var(--c--globals--spacings--xs) var(--c--globals--spacings--sm);
+    border-radius: 4px;
+    background-color: var(--c--contextuals--background--semantic--warning--tertiary);
+    color: var(--c--contextuals--content--semantic--warning--primary);
+    font-size: var(--c--globals--font--sizes--sm);
+    margin-top: var(--c--globals--spacings--xs);
+}
+
 .calendar-invite__rsvp-buttons {
     display: flex;
     gap: var(--c--globals--spacings--sm);

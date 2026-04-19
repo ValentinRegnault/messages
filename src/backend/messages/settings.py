@@ -281,6 +281,20 @@ class Base(Configuration):
         "my-shared-secret-mda", environ_name="MDA_API_SECRET", environ_prefix=None
     )
 
+    # CalDAV instance-level settings (optional, enables calendar features
+    # for all mailboxes against any CalDAV server).
+    # CALDAV_DEFAULT_URL points at the CalDAV server root.
+    # CALDAV_DEFAULT_PASSWORD is the static shared secret sent as the HTTP
+    # Basic Auth password. The Basic Auth username is the acting mailbox's
+    # email (per-request), so the server can route to that user's
+    # calendars via principal discovery.
+    CALDAV_DEFAULT_URL = values.Value(
+        None, environ_name="CALDAV_DEFAULT_URL", environ_prefix=None
+    )
+    CALDAV_DEFAULT_PASSWORD = values.Value(
+        None, environ_name="CALDAV_DEFAULT_PASSWORD", environ_prefix=None
+    )
+
     # Spam filtering settings
 
     # Default spam configuration for all mail domains, overrideable per mail

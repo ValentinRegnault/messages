@@ -10,47 +10,62 @@ from drf_spectacular.utils import (
     extend_schema,
     inline_serializer,
 )
-from rest_framework import permissions, status
 from rest_framework import serializers as drf_serializers
+from rest_framework import status
+from rest_framework.exceptions import NotFound
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from core import models
+from core.api.permissions import HasAccessToMailbox
 from core.api.viewsets.task import register_task_owner
+from core.services.calendar.service import CalDAVService
 from core.services.calendar.tasks import calendar_add_event_task, calendar_rsvp_task
 
 logger = logging.getLogger(__name__)
 
 
 class CalDAVChannelMixin:
-    """Mixin to get the CalDAV channel for a mailbox."""
+    """Mixin to get the CalDAV channel or instance-level config for a mailbox."""
 
     @cached_property
     def mailbox(self):
+        """The Mailbox referenced in the URL."""
         return get_object_or_404(models.Mailbox, id=self.kwargs["mailbox_id"])
 
-    def get_caldav_channel(self):
-        """Get the CalDAV channel for the mailbox, or None."""
-        return (
-            models.Channel.objects.filter(
-                mailbox=self.mailbox, type="caldav"
-            ).first()
+    @cached_property
+    def caldav_channel(self):
+        """The CalDAV channel for the mailbox, if any."""
+        return models.Channel.objects.filter(
+            mailbox=self.mailbox, type="caldav"
+        ).first()
+
+    def get_caldav_service(self):
+        """Get a CalDAVService for this mailbox.
+
+        Priority: per-mailbox channel > instance-level config.
+        For the instance-level path, the mailbox email is sent as the
+        Basic Auth username so the CalDAV server can route to the
+        user's calendars via principal discovery.
+        Returns None if neither is configured.
+        """
+        return CalDAVService.from_channel_or_instance(
+            self.caldav_channel, str(self.mailbox)
         )
 
-    def require_caldav_channel(self):
-        """Get the CalDAV channel or raise 404."""
-        channel = self.get_caldav_channel()
-        if not channel:
-            from rest_framework.exceptions import NotFound
+    def require_caldav_service(self):
+        """Get the CalDAVService or raise 404."""
+        service = self.get_caldav_service()
+        if not service:
             raise NotFound("No CalDAV calendar is configured for this mailbox.")
-        return channel
+        return service
 
 
 @extend_schema(tags=["calendar"])
 class CalendarRsvpView(CalDAVChannelMixin, APIView):
     """Submit an RSVP response to a calendar event."""
 
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [HasAccessToMailbox]
 
     @extend_schema(
         request=inline_serializer(
@@ -79,7 +94,8 @@ class CalendarRsvpView(CalDAVChannelMixin, APIView):
             ),
         },
     )
-    def post(self, request, mailbox_id):
+    def post(self, request, mailbox_id):  # pylint: disable=unused-argument
+        """Submit an RSVP response via a background CalDAV task."""
         ics_data = request.data.get("ics_data")
         response_type = request.data.get("response")
         calendar_id = request.data.get("calendar_id")
@@ -96,16 +112,16 @@ class CalendarRsvpView(CalDAVChannelMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        channel = self.require_caldav_channel()
-
-        # Use the mailbox email as the attendee email
-        attendee_email = str(self.mailbox)
+        self.require_caldav_service()
+        channel = self.caldav_channel
+        mailbox_email = str(self.mailbox)
 
         task = calendar_rsvp_task.delay(
-            channel_id=str(channel.id),
+            channel_id=str(channel.id) if channel else None,
+            mailbox_email=mailbox_email,
             ics_data=ics_data,
             response=response_type,
-            attendee_email=attendee_email,
+            attendee_email=mailbox_email,
             calendar_id=calendar_id,
         )
         register_task_owner(task.id, request.user.id)
@@ -117,7 +133,7 @@ class CalendarRsvpView(CalDAVChannelMixin, APIView):
 class CalendarAddEventView(CalDAVChannelMixin, APIView):
     """Add an event to a CalDAV calendar."""
 
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [HasAccessToMailbox]
 
     @extend_schema(
         request=inline_serializer(
@@ -142,7 +158,8 @@ class CalendarAddEventView(CalDAVChannelMixin, APIView):
             ),
         },
     )
-    def post(self, request, mailbox_id):
+    def post(self, request, mailbox_id):  # pylint: disable=unused-argument
+        """Add an event to the mailbox's CalDAV calendar via a background task."""
         ics_data = request.data.get("ics_data")
         calendar_id = request.data.get("calendar_id")
 
@@ -152,10 +169,12 @@ class CalendarAddEventView(CalDAVChannelMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        channel = self.require_caldav_channel()
+        self.require_caldav_service()
+        channel = self.caldav_channel
 
         task = calendar_add_event_task.delay(
-            channel_id=str(channel.id),
+            channel_id=str(channel.id) if channel else None,
+            mailbox_email=str(self.mailbox),
             ics_data=ics_data,
             calendar_id=calendar_id,
         )
@@ -166,9 +185,13 @@ class CalendarAddEventView(CalDAVChannelMixin, APIView):
 
 @extend_schema(tags=["calendar"])
 class CalendarConflictsView(CalDAVChannelMixin, APIView):
-    """Check for conflicting events in a given time range."""
+    """Check for conflicting events in a given time range.
 
-    permission_classes = [permissions.IsAuthenticated]
+    Note: CalDAV calls are intentionally blocking (synchronous) here because
+    the user is waiting for the result before interacting with the UI.
+    """
+
+    permission_classes = [HasAccessToMailbox]
 
     @extend_schema(
         request=inline_serializer(
@@ -193,7 +216,8 @@ class CalendarConflictsView(CalDAVChannelMixin, APIView):
             ),
         },
     )
-    def post(self, request, mailbox_id):
+    def post(self, request, mailbox_id):  # pylint: disable=unused-argument
+        """Return a list of events overlapping the requested time range."""
         start = request.data.get("start")
         end = request.data.get("end")
 
@@ -214,14 +238,11 @@ class CalendarConflictsView(CalDAVChannelMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        channel = self.require_caldav_channel()
-
-        from core.services.calendar.service import CalDAVService
+        service = self.require_caldav_service()
 
         try:
-            service = CalDAVService.from_channel(channel)
             conflicts = service.check_conflicts(start=start, end=end)
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             logger.exception("Error checking calendar conflicts: %s", e)
             return Response(
                 {"detail": "Failed to check for conflicts."},
@@ -233,9 +254,13 @@ class CalendarConflictsView(CalDAVChannelMixin, APIView):
 
 @extend_schema(tags=["calendar"])
 class CalendarListView(CalDAVChannelMixin, APIView):
-    """List available calendars on the CalDAV server."""
+    """List available calendars on the CalDAV server.
 
-    permission_classes = [permissions.IsAuthenticated]
+    Note: CalDAV calls are intentionally blocking (synchronous) here because
+    the user is waiting for the result before interacting with the UI.
+    """
+
+    permission_classes = [HasAccessToMailbox]
 
     @extend_schema(
         responses={
@@ -249,17 +274,15 @@ class CalendarListView(CalDAVChannelMixin, APIView):
             ),
         },
     )
-    def get(self, request, mailbox_id):
-        channel = self.get_caldav_channel()
-        if not channel:
+    def get(self, request, mailbox_id):  # pylint: disable=unused-argument
+        """Return the list of calendars available for the mailbox."""
+        service = self.get_caldav_service()
+        if not service:
             return Response({"calendars": []}, status=status.HTTP_200_OK)
 
-        from core.services.calendar.service import CalDAVService
-
         try:
-            service = CalDAVService.from_channel(channel)
             calendars = service.list_calendars()
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             logger.exception("Error listing calendars: %s", e)
             return Response(
                 {"detail": "Failed to list calendars."},

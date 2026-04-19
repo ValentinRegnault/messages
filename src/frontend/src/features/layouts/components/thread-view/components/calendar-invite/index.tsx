@@ -92,7 +92,10 @@ const ConflictWarning = ({ conflicts, language }: { conflicts: ConflictInfo[]; l
             </div>
             <ul className="calendar-invite__conflicts-list">
                 {conflicts.map((conflict, idx) => (
-                    <li key={idx} className="calendar-invite__conflict-item">
+                    <li
+                        key={`${conflict.calendar_name}-${conflict.summary}-${conflict.start ?? idx}`}
+                        className="calendar-invite__conflict-item"
+                    >
                         <span className="calendar-invite__conflict-summary">
                             {conflict.summary}
                         </span>
@@ -443,6 +446,8 @@ const fetchAndParseCalendar = async (url: string): Promise<IcsCalendar> => {
 };
 
 const fetchIcsContent = async (url: string): Promise<string> => {
+    // Bare fetch (not fetchAPI): this is a blob download URL serving
+    // raw ICS text, not a JSON API endpoint.
     const response = await fetch(url, { credentials: "include" });
     if (!response.ok) {
         throw new Error(`HTTP error: ${response.status}`);
@@ -493,7 +498,7 @@ export const CalendarInvite = ({
     });
 
     // Fetch available calendars
-    const { data: calendarsResponse } = useQuery<CalendarsApiResponse>({
+    const { data: calendarsResponse, isError: isCalendarsError } = useQuery<CalendarsApiResponse>({
         queryKey: ["calendar-calendars", mailboxId],
         queryFn: () =>
             fetchAPI<CalendarsApiResponse>(
@@ -503,7 +508,7 @@ export const CalendarInvite = ({
         meta: { noGlobalError: true },
     });
 
-    const calendars = calendarsResponse?.data?.calendars ?? [];
+    const calendars = isCalendarsError ? [] : (calendarsResponse?.data?.calendars ?? []);
     const hasCalDAV = calendars.length > 0;
 
     // Set default calendar when calendars load
@@ -517,7 +522,7 @@ export const CalendarInvite = ({
     const eventStart = firstEvent?.start?.date;
     const eventEnd = getEventEnd(firstEvent);
 
-    const { data: conflictsResponse } = useQuery<ConflictsApiResponse>({
+    const { data: conflictsResponse, isError: isConflictsError } = useQuery<ConflictsApiResponse>({
         queryKey: [
             "calendar-conflicts",
             mailboxId,
@@ -540,17 +545,20 @@ export const CalendarInvite = ({
         meta: { noGlobalError: true },
     });
 
-    const conflicts = conflictsResponse?.data?.conflicts ?? [];
+    const conflicts = isConflictsError ? [] : (conflictsResponse?.data?.conflicts ?? []);
+    const isCalDAVUnavailable = isCalendarsError || isConflictsError;
 
     // Task polling for RSVP/add-to-calendar (shared with import code)
     const [taskId, setTaskId] = useState<string | null>(null);
+    const [isSubmitting, setIsSubmitting] = useState(false);
     const taskStatus = useTaskStatus(taskId);
-    const isPending = !!taskId && taskStatus?.state !== StatusEnum.SUCCESS && taskStatus?.state !== StatusEnum.FAILURE;
+    const isPending = isSubmitting || (!!taskId && taskStatus?.state !== StatusEnum.SUCCESS && taskStatus?.state !== StatusEnum.FAILURE);
 
     useEffect(() => {
         if (!taskStatus) return;
         if (taskStatus.state === StatusEnum.SUCCESS) {
             setTaskId(null);
+            setIsSubmitting(false);
             addToast(
                 <ToasterItem type="info">
                     <span className="material-icons">check_circle</span>
@@ -563,6 +571,8 @@ export const CalendarInvite = ({
             );
         } else if (taskStatus.state === StatusEnum.FAILURE) {
             setTaskId(null);
+            setIsSubmitting(false);
+            setRsvpResponse(null);
             addToast(
                 <ToasterItem type="error">
                     <span className="material-icons">error</span>
@@ -570,12 +580,13 @@ export const CalendarInvite = ({
                 </ToasterItem>,
             );
         }
-    }, [taskStatus?.state, rsvpResponse, t]);
+    }, [taskStatus, rsvpResponse, t]);
 
     const handleRsvp = useCallback(
         async (response: RsvpResponse) => {
-            if (!mailboxId || !icsContent) return;
+            if (!mailboxId || !icsContent || isPending) return;
 
+            setIsSubmitting(true);
             try {
                 const result = await fetchAPI<RsvpApiResponse>(
                     `/api/v1.0/mailboxes/${mailboxId}/calendar/rsvp/`,
@@ -592,6 +603,7 @@ export const CalendarInvite = ({
                 setRsvpResponse(response);
                 setTaskId(result.data.task_id);
             } catch {
+                setIsSubmitting(false);
                 addToast(
                     <ToasterItem type="error">
                         <span>{t("An unexpected error occurred.")}</span>
@@ -599,12 +611,13 @@ export const CalendarInvite = ({
                 );
             }
         },
-        [mailboxId, icsContent, effectiveCalendarId, t],
+        [mailboxId, icsContent, effectiveCalendarId, isPending, t],
     );
 
     const handleAddToCalendar = useCallback(async () => {
-        if (!mailboxId || !icsContent) return;
+        if (!mailboxId || !icsContent || isPending) return;
 
+        setIsSubmitting(true);
         try {
             const result = await fetchAPI<RsvpApiResponse>(
                 `/api/v1.0/mailboxes/${mailboxId}/calendar/add/`,
@@ -620,13 +633,14 @@ export const CalendarInvite = ({
             setRsvpResponse(null);
             setTaskId(result.data.task_id);
         } catch {
+            setIsSubmitting(false);
             addToast(
                 <ToasterItem type="error">
                     <span>{t("An unexpected error occurred.")}</span>
                 </ToasterItem>,
             );
         }
-    }, [mailboxId, icsContent, effectiveCalendarId, t]);
+    }, [mailboxId, icsContent, effectiveCalendarId, isPending, t]);
 
     if (isLoading) {
         return (
@@ -706,6 +720,14 @@ export const CalendarInvite = ({
                     conflicts={index === 0 ? conflicts : []}
                 />
             ))}
+
+            {/* CalDAV unavailable warning */}
+            {isCalDAVUnavailable && (
+                <div className="calendar-invite__caldav-unavailable" role="alert">
+                    <Icon name="cloud_off" type={IconType.OUTLINED} />
+                    <span>{t("Calendar service unavailable")}</span>
+                </div>
+            )}
 
             {/* Calendar chooser */}
             {hasCalDAV && (
