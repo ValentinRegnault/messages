@@ -9,7 +9,7 @@ library's dependency surface.
 import logging
 import uuid
 from datetime import timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from django.conf import settings as django_settings
 
@@ -254,18 +254,39 @@ class CalDAVService:
             if not isinstance(attendees, list):
                 attendees = [attendees]
             for att in attendees:
-                if email_lower not in str(att).lower():
+                addr = str(att).strip().lower()
+                if addr.startswith("mailto:"):
+                    addr = addr[len("mailto:") :]
+                if addr != email_lower:
                     continue
                 att.params["PARTSTAT"] = new_partstat
                 att.params.pop("RSVP", None)
 
     def _pick_calendar_url(self, calendar_id):
-        if calendar_id:
-            return calendar_id
+        if calendar_id and not self._same_origin(calendar_id):
+            raise CalDAVError(
+                "Calendar URL host does not match the configured CalDAV server."
+            )
         calendars = self.list_calendars()
         if not calendars:
             raise CalDAVError("No calendars available on this CalDAV server.")
+        if calendar_id:
+            valid_ids = {c["id"] for c in calendars}
+            if calendar_id not in valid_ids:
+                raise CalDAVError("Calendar is not in this user's calendar list.")
+            return calendar_id
         return calendars[0]["id"]
+
+    def _same_origin(self, candidate_url):
+        """Whether ``candidate_url`` shares scheme + host + port with ``self.url``."""
+        cand = urlparse(candidate_url)
+        base = urlparse(self.url)
+        if not cand.scheme or not cand.netloc:
+            return False
+        return (cand.scheme.lower(), cand.netloc.lower()) == (
+            base.scheme.lower(),
+            base.netloc.lower(),
+        )
 
     def _put_event(self, calendar_url, ics_data):
         uid = ""

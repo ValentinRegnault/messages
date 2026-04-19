@@ -16,7 +16,7 @@ from icalendar import Calendar as ICalendar
 
 from core import factories
 from core.enums import MailboxRoleChoices
-from core.services.calendar.service import CalDAVService
+from core.services.calendar.service import CalDAVError, CalDAVService
 
 
 class _SilentHandler(WSGIRequestHandler):
@@ -725,6 +725,93 @@ class TestUpdatePartstat:
         by_email = {str(a).lower(): a for a in attendees}
         assert by_email["mailto:me@example.com"].params["PARTSTAT"] == "ACCEPTED"
         assert by_email["mailto:other@example.com"].params["PARTSTAT"] == "NEEDS-ACTION"
+
+    def test_substring_email_does_not_match(self):
+        """An attendee whose address contains the target as a substring must
+        not be updated; only an exact email match is."""
+        ics = (
+            "BEGIN:VCALENDAR\r\n"
+            "VERSION:2.0\r\n"
+            "PRODID:-//Test//Test//EN\r\n"
+            "BEGIN:VEVENT\r\n"
+            "UID:x@example.com\r\n"
+            "DTSTART:20260101T120000Z\r\n"
+            "DTEND:20260101T130000Z\r\n"
+            "SUMMARY:X\r\n"
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:notme@example.com\r\n"
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:me@example.com\r\n"
+            "END:VEVENT\r\n"
+            "END:VCALENDAR\r\n"
+        )
+        cal = ICalendar.from_ical(ics)
+        CalDAVService._update_partstat(cal, "me@example.com", "ACCEPTED")
+
+        attendees = cal.walk("VEVENT")[0].get("ATTENDEE")
+        by_email = {str(a).lower(): a for a in attendees}
+        assert by_email["mailto:me@example.com"].params["PARTSTAT"] == "ACCEPTED"
+        assert by_email["mailto:notme@example.com"].params["PARTSTAT"] == "NEEDS-ACTION"
+
+
+class TestPickCalendarUrl:
+    """Direct tests for calendar URL selection / SSRF guard."""
+
+    def _service_with_calendars(self, calendar_ids):
+        service = CalDAVService(url="https://caldav.example.com/")
+        service.list_calendars = lambda: [  # type: ignore[method-assign]
+            {"id": cid, "name": cid} for cid in calendar_ids
+        ]
+        return service
+
+    def test_returns_first_when_no_id_given(self):
+        service = self._service_with_calendars(
+            ["https://caldav.example.com/u/cal1/", "https://caldav.example.com/u/cal2/"]
+        )
+        assert service._pick_calendar_url(None) == "https://caldav.example.com/u/cal1/"
+
+    def test_accepts_known_calendar_id(self):
+        service = self._service_with_calendars(
+            ["https://caldav.example.com/u/cal1/", "https://caldav.example.com/u/cal2/"]
+        )
+        assert (
+            service._pick_calendar_url("https://caldav.example.com/u/cal2/")
+            == "https://caldav.example.com/u/cal2/"
+        )
+
+    def test_rejects_arbitrary_url(self):
+        """An attacker-controlled URL must not be used as a calendar target."""
+        service = self._service_with_calendars(["https://caldav.example.com/u/cal1/"])
+        with pytest.raises(CalDAVError):
+            service._pick_calendar_url("https://attacker.example.org/evil/")
+
+    def test_rejects_cross_origin_before_listing(self):
+        """The origin check must reject foreign hosts even if list_calendars()
+        somehow returned a matching entry — defense in depth."""
+        service = CalDAVService(url="https://caldav.example.com/")
+        called = {"n": 0}
+
+        def _spy():
+            called["n"] += 1
+            return [{"id": "https://attacker.example.org/evil/", "name": "evil"}]
+
+        service.list_calendars = _spy  # type: ignore[method-assign]
+        with pytest.raises(CalDAVError):
+            service._pick_calendar_url("https://attacker.example.org/evil/")
+        assert called["n"] == 0
+
+    def test_rejects_scheme_relative_or_malformed(self):
+        service = self._service_with_calendars(["https://caldav.example.com/u/cal1/"])
+        with pytest.raises(CalDAVError):
+            service._pick_calendar_url("/u/cal1/")
+
+    def test_rejects_unknown_calendar_on_same_host(self):
+        service = self._service_with_calendars(["https://caldav.example.com/u/cal1/"])
+        with pytest.raises(CalDAVError):
+            service._pick_calendar_url("https://caldav.example.com/u/other/")
+
+    def test_raises_when_no_calendars(self):
+        service = self._service_with_calendars([])
+        with pytest.raises(CalDAVError):
+            service._pick_calendar_url(None)
 
 
 # ---------------------------------------------------------------------------
