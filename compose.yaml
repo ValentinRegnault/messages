@@ -163,6 +163,10 @@ services:
     volumes:
       - ./src/backend:/app
       - ./data/static:/data/static
+    deploy:
+      resources:
+        limits:
+          memory: 1GB
     depends_on:
       - backend-dev
 
